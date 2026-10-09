@@ -10,28 +10,69 @@ Run from the execution-specs repo root:
 import argparse
 from pathlib import Path
 
-from execution_testing import Bytecode, Hash, IteratingBytecode, Op, While
+from execution_testing import (
+    DETERMINISTIC_FACTORY_ADDRESS,
+    Bytecode,
+    Hash,
+    IteratingBytecode,
+    Op,
+    While,
+)
 from execution_testing.forks import Amsterdam, Osaka
 
 from tests.benchmark.helper.account_creator import AccountCreator, AccountMode
 
 FORKS = {"Amsterdam": Amsterdam, "Osaka": Osaka}
+MODES = {m.name: m for m in AccountMode}
 
 
-def build_run_code() -> IteratingBytecode:
-    """Mirror test_account_access: EXTCODESIZE, NO_CACHE, JUMPDEST targets."""
-    creator = AccountCreator(AccountMode.EXISTING_CONTRACT_JUMPDEST)
+CALL_OPCODES = {"CALL", "CALLCODE", "DELEGATECALL", "STATICCALL"}
+OPCODES = {
+    "BALANCE": Op.BALANCE,
+    "EXTCODESIZE": Op.EXTCODESIZE,
+    "EXTCODEHASH": Op.EXTCODEHASH,
+    "CALL": Op.CALL,
+    "CALLCODE": Op.CALLCODE,
+    "DELEGATECALL": Op.DELEGATECALL,
+    "STATICCALL": Op.STATICCALL,
+}
+
+
+def build_run_code(mode: AccountMode, opcode_name: str,
+                   code_size: int | None = None) -> IteratingBytecode:
+    """Mirror test_account_access for the chosen opcode and target mode."""
+    creator = (AccountCreator(mode, code_size=code_size)
+               if code_size else AccountCreator(mode))
     source = creator.address_source(Op.CALLDATALOAD(0))
-    attack = Op.POP(
-        Op.EXTCODESIZE(address=source.address_op(), address_warm=False)
-    )
+    opcode = OPCODES[opcode_name]
+
+    if opcode_name in CALL_OPCODES:
+        attack = Op.POP(
+            opcode(
+                address=source.address_op(),
+                value=0,
+                address_warm=False,
+                value_transfer=False,
+                account_new=False,
+            )
+            if opcode_name in ("CALL", "CALLCODE")
+            else opcode(address=source.address_op(), address_warm=False)
+        )
+    else:
+        attack = Op.POP(
+            opcode(address=source.address_op(), address_warm=False)
+        )
+
     setup = source.setup + Op.ADD(1, Op.CALLDATALOAD(32)) + Op.CALLDATALOAD(0)
     loop = While(
         body=Bytecode() + attack + source.next_op(),
         condition=Op.PUSH1(1) + Op.ADD + Op.DUP1 + Op.DUP3 + Op.GT,
     )
+    # A call enters the target's code, so its execution counts per iteration.
+    executes = opcode_name in CALL_OPCODES and creator.has_execution_code
+    subcall = creator.execution_code if executes else Op.STOP
     return IteratingBytecode(
-        setup=setup, iterating=loop, iterating_subcall=Op.STOP
+        setup=setup, iterating=loop, iterating_subcall=subcall
     )
 
 
@@ -54,14 +95,27 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gas", type=int, default=200, help="millions of gas")
     parser.add_argument("--fork", default="Amsterdam", choices=list(FORKS))
+    parser.add_argument("--account-mode", default="EXISTING_CONTRACT_JUMPDEST",
+                        choices=list(MODES), help="benchmark target variant")
+    parser.add_argument("--opcode", default="EXTCODESIZE",
+                        choices=list(OPCODES),
+                        help="benchmarked opcode")
+    parser.add_argument("--package", default="accountaccess",
+                        help="Go package name for the output")
+    parser.add_argument("--code-size", type=int, default=None,
+                        help="target contract runtime size (contract modes only)")
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
 
     fork = FORKS[args.fork]
+    mode = MODES[args.account_mode]
     gas_limit = args.gas * 1_000_000
-    run_code = build_run_code()
+    run_code = build_run_code(mode, args.opcode, args.code_size)
     runtime = bytes(run_code)
     initcode = deploy_initcode(runtime)
+    creator = (AccountCreator(mode, code_size=args.code_size)
+               if args.code_size else AccountCreator(mode))
+    needs_targets = creator.derives_address_via_create2
 
     counts = list(
         run_code.tx_iterations_by_gas_limit(
@@ -88,9 +142,13 @@ def main() -> None:
         "//",
         f"// fork={fork.name()} blockGasLimit={gas_limit}"
         f" transactions={len(rows)} iterations={sum(counts)}",
-        f"// targets required: JUMPDEST CREATE2 salts 0..{start - 1}",
+        f"// opcode={args.opcode} accountMode={mode.name}",
+        ("// targets required: CREATE2 salts 0.."
+         f"{start - 1} (must be pre-deployed)")
+        if needs_targets else
+        ("// targets: sequential empty accounts, nothing to deploy"),
         "",
-        "package accountaccess",
+        f"package {args.package}",
         "",
         'import "github.com/ethereum/go-ethereum/common"',
         "",
@@ -113,10 +171,28 @@ def main() -> None:
         )
     lines += ["}", ""]
 
+    if needs_targets:
+        lines += [
+            "// DeterministicFactory is the CREATE2 proxy the targets are",
+            "// deployed through. It takes raw `salt || initcode` calldata.",
+            'var DeterministicFactory = common.HexToAddress('
+            f'"{DETERMINISTIC_FACTORY_ADDRESS}")',
+            "",
+            "// TargetInitcode deploys one benchmark target. The same initcode",
+            "// is used for every salt, so all targets share a CREATE2 hash.",
+            f'var TargetInitcode = common.FromHex("0x{creator.initcode.hex()}")',
+            "",
+            "// TargetCount is how many targets TxSpecs reads from.",
+            f"const TargetCount = {start}",
+            "",
+        ]
+
     args.out.write_text("\n".join(lines))
     print(f"wrote {args.out}")
-    print(f"  fork={fork.name()} gas={gas_limit:,} txs={len(rows)} "
-          f"iterations={sum(counts):,} targets=0..{start - 1}")
+    print(f"  fork={fork.name()} opcode={args.opcode} mode={mode.name} "
+          f"gas={gas_limit:,} "
+          f"txs={len(rows)} iterations={sum(counts):,}")
+    print(f"  targets: {'CREATE2 salts 0..' + str(start - 1) if needs_targets else 'empty accounts, no deployment needed'}")
 
 
 if __name__ == "__main__":

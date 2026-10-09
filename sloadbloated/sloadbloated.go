@@ -1,6 +1,6 @@
-// Package accountaccess replays the execution-specs test_account_access
-// benchmark block against a chain that already holds the JUMPDEST targets.
-package accountaccess
+// Package sloadbloated replays the execution-specs sload-bloated benchmark block
+// against a storage-bloated, EIP-7702 delegated EOA.
+package sloadbloated
 
 import (
 	"context"
@@ -12,63 +12,68 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 
+	"github.com/ethpandaops/spamoor/plugins/spamoor-eels-benchmarks/bloated"
 	"github.com/ethpandaops/spamoor/scenario"
 	"github.com/ethpandaops/spamoor/spamoor"
 	"github.com/ethpandaops/spamoor/txbuilder"
 	"github.com/ethpandaops/spamoor/txtypes"
-	"github.com/ethpandaops/spamoor/utils"
 )
 
-// ScenarioOptions configures the account-access benchmark replay.
+// ScenarioOptions configures the benchmark replay.
 type ScenarioOptions struct {
-	TotalCount    uint64  `yaml:"total_count"`
-	Throughput    uint64  `yaml:"throughput"`
-	MaxPending    uint64  `yaml:"max_pending"`
-	MaxWallets    uint64  `yaml:"max_wallets"`
-	Rebroadcast   uint64  `yaml:"rebroadcast"`
-	BaseFee       float64 `yaml:"base_fee"`
-	TipFee        float64 `yaml:"tip_fee"`
-	BaseFeeWei    string  `yaml:"base_fee_wei"`
-	TipFeeWei     string  `yaml:"tip_fee_wei"`
-	TargetAddress string  `yaml:"target_address"`
-	DeployGas     uint64  `yaml:"deploy_gas"`
-	Timeout       string  `yaml:"timeout"`
-	ClientGroup   string  `yaml:"client_group"`
-	LogTxs        bool    `yaml:"log_txs"`
+	TotalCount      uint64  `yaml:"total_count"`
+	Throughput      uint64  `yaml:"throughput"`
+	MaxPending      uint64  `yaml:"max_pending"`
+	MaxWallets      uint64  `yaml:"max_wallets"`
+	Rebroadcast     uint64  `yaml:"rebroadcast"`
+	BaseFee         float64 `yaml:"base_fee"`
+	TipFee          float64 `yaml:"tip_fee"`
+	BaseFeeWei      string  `yaml:"base_fee_wei"`
+	TipFeeWei       string  `yaml:"tip_fee_wei"`
+	AuthorityKey    string  `yaml:"authority_key"`
+	DeployGas       uint64  `yaml:"deploy_gas"`
+	DeployerFunding string  `yaml:"deployer_funding"`
+	Timeout         string  `yaml:"timeout"`
+	ClientGroup     string  `yaml:"client_group"`
+	LogTxs          bool    `yaml:"log_txs"`
+	ExistingSlots   bool    `yaml:"existing_slots"`
 }
 
-// Scenario replays TxSpecs in order, looping once the block is exhausted.
+// Scenario replays the benchmark block against the delegated authority.
 type Scenario struct {
 	options    ScenarioOptions
 	logger     *logrus.Entry
 	walletPool *spamoor.WalletPool
 
-	targetAddr common.Address
+	authority   *bloated.Authority
+	runtimeAddr common.Address
+	setterAddr  common.Address
 }
 
 // ScenarioName is the name used on the CLI and in the web UI.
-var ScenarioName = "account-access"
+var ScenarioName = "sload-bloated"
 
 // ScenarioDefaultOptions is the starting configuration for the scenario.
 var ScenarioDefaultOptions = ScenarioOptions{
-	TotalCount:    0,
-	Throughput:    uint64(len(TxSpecs)),
-	MaxPending:    0,
-	MaxWallets:    0,
-	Rebroadcast:   120,
-	BaseFee:       20,
-	TipFee:        2,
-	TargetAddress: "",
-	DeployGas:     500000,
-	Timeout:       "",
-	ClientGroup:   "",
-	LogTxs:        false,
+	TotalCount:      uint64(len(GasLimits)),
+	Throughput:      uint64(len(GasLimits)),
+	MaxPending:      0,
+	MaxWallets:      0,
+	Rebroadcast:     120,
+	BaseFee:         20,
+	TipFee:          2,
+	DeployGas:       1000000,
+	DeployerFunding: "500000000000000000",
+	Timeout:         "",
+	ClientGroup:     "",
+	LogTxs:          false,
+	ExistingSlots:   false,
 }
 
 // ScenarioDescriptor registers the scenario with spamoor.
 var ScenarioDescriptor = scenario.Descriptor{
 	Name:           ScenarioName,
-	Description:    "Replays the test_account_access benchmark block (cold EXTCODESIZE over CREATE2 JUMPDEST targets)",
+	Description:    "Replays test_sload_bloated against a 7702-delegated, storage-bloated EOA",
 	DefaultOptions: ScenarioDefaultOptions,
 	NewScenario:    newScenario,
 }
@@ -91,15 +96,17 @@ func (s *Scenario) Flags(flags *pflag.FlagSet) error {
 	flags.Float64Var(&s.options.TipFee, "tipfee", ScenarioDefaultOptions.TipFee, "Max tip per gas to use in transactions (in gwei)")
 	flags.StringVar(&s.options.BaseFeeWei, "basefee-wei", "", "Max fee per gas in wei (overrides --basefee)")
 	flags.StringVar(&s.options.TipFeeWei, "tipfee-wei", "", "Max tip per gas in wei (overrides --tipfee)")
-	flags.StringVar(&s.options.TargetAddress, "target-address", ScenarioDefaultOptions.TargetAddress, "Address of an already deployed run_code contract (skips deployment)")
-	flags.Uint64Var(&s.options.DeployGas, "deploy-gas", ScenarioDefaultOptions.DeployGas, "Gas limit for the run_code deployment transaction")
+	flags.StringVar(&s.options.AuthorityKey, "authority-key", "", "Private key of the storage-bloated EOA to delegate (required)")
+	flags.Uint64Var(&s.options.DeployGas, "deploy-gas", ScenarioDefaultOptions.DeployGas, "Gas limit for the runtime deployment transaction")
+	flags.StringVar(&s.options.DeployerFunding, "deployer-funding", ScenarioDefaultOptions.DeployerFunding, "Wei to fund the deployer wallet with")
 	flags.StringVar(&s.options.Timeout, "timeout", ScenarioDefaultOptions.Timeout, "Timeout for the scenario (e.g. '1h', '30m')")
 	flags.StringVar(&s.options.ClientGroup, "client-group", ScenarioDefaultOptions.ClientGroup, "Client group to use for sending transactions")
 	flags.BoolVar(&s.options.LogTxs, "log-txs", ScenarioDefaultOptions.LogTxs, "Log all submitted transactions")
+	flags.BoolVar(&s.options.ExistingSlots, "existing-slots", ScenarioDefaultOptions.ExistingSlots, "Target slots that already hold values")
 	return nil
 }
 
-// Init prepares the wallet pool and validates the configuration.
+// Init prepares the wallet pool and loads the authority key.
 func (s *Scenario) Init(options *scenario.Options) error {
 	s.walletPool = options.WalletPool
 
@@ -109,18 +116,29 @@ func (s *Scenario) Init(options *scenario.Options) error {
 		}
 	}
 
-	// Every transaction burns most of a block, so a handful of wallets is
-	// plenty: more would only spread the refill budget thinner.
+	authority, err := bloated.LoadAuthority(s.options.AuthorityKey)
+	if err != nil {
+		return err
+	}
+	s.authority = authority
+
 	walletCount := s.options.MaxWallets
 	if walletCount == 0 {
-		walletCount = uint64(len(TxSpecs))
+		walletCount = s.options.Throughput
+		if walletCount < 4 {
+			walletCount = 4
+		}
 	}
 	s.walletPool.SetWalletCount(walletCount)
 
+	funding, err := uint256.FromDecimal(s.options.DeployerFunding)
+	if err != nil {
+		return fmt.Errorf("invalid deployer-funding %q: %w", s.options.DeployerFunding, err)
+	}
 	s.walletPool.AddWellKnownWallet(&spamoor.WellKnownWalletConfig{
 		Name:          "deployer",
-		RefillAmount:  utils.EtherToWei(uint256.NewInt(5)),
-		RefillBalance: utils.EtherToWei(uint256.NewInt(1)),
+		RefillAmount:  funding,
+		RefillBalance: uint256.NewInt(0).Div(funding, uint256.NewInt(4)),
 		VeryWellKnown: false,
 	})
 
@@ -131,42 +149,68 @@ func (s *Scenario) Init(options *scenario.Options) error {
 	return nil
 }
 
-// Run deploys the attack contract if needed, then replays the block.
+// Run deploys the runtime, delegates the authority to it, then replays.
 func (s *Scenario) Run(ctx context.Context) error {
 	s.logger.Infof("starting scenario: %s", ScenarioName)
 	defer s.logger.Infof("scenario %s finished.", ScenarioName)
 
-	if s.options.TargetAddress != "" {
-		if !common.IsHexAddress(s.options.TargetAddress) {
-			return fmt.Errorf("invalid target address: %s", s.options.TargetAddress)
-		}
-		s.targetAddr = common.HexToAddress(s.options.TargetAddress)
-		s.logger.Infof("using existing run_code contract at %v", s.targetAddr.Hex())
-	} else {
-		receipt, err := s.deployRunCode(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to deploy run_code: %w", err)
-		}
-		s.targetAddr = receipt.ContractAddress
-		s.logger.Infof("deployed run_code at %v (block #%v)", s.targetAddr.Hex(), receipt.BlockNumber.Uint64())
+	deployer := s.walletPool.GetWellKnownWallet("deployer")
+	if deployer == nil {
+		return fmt.Errorf("deployer wallet not found")
+	}
+	client := s.walletPool.GetClient(
+		spamoor.WithClientSelectionMode(spamoor.SelectClientByIndex, 0),
+		spamoor.WithClientGroup(s.options.ClientGroup),
+	)
+	if client == nil {
+		return scenario.ErrNoClients
+	}
+	baseFeeWei, tipFeeWei := spamoor.ResolveFees(s.options.BaseFee, s.options.TipFee, s.options.BaseFeeWei, s.options.TipFeeWei)
+	feeCapBig, tipCapBig, err := s.walletPool.GetSuggestedFees(client, baseFeeWei, tipFeeWei)
+	if err != nil {
+		return fmt.Errorf("failed to get suggested fees: %w", err)
+	}
+	feeCap := uint256.MustFromBig(feeCapBig)
+	tipCap := uint256.MustFromBig(tipCapBig)
+
+	s.runtimeAddr, err = bloated.DeployContract(ctx, s.walletPool, deployer,
+		client, sloadInitcode(), s.options.DeployGas, feeCap, tipCap)
+	if err != nil {
+		return fmt.Errorf("failed to deploy runtime: %w", err)
+	}
+	s.logger.Infof("deployed sload runtime at %v", s.runtimeAddr.Hex())
+
+	// The cursor lives in slot 0, so the sweep must be anchored before the
+	// runtime is delegated in: a stale cursor silently reads empty slots.
+	s.setterAddr, err = bloated.DeployContract(ctx, s.walletPool, deployer,
+		client, SetterInitcode, s.options.DeployGas, feeCap, tipCap)
+	if err != nil {
+		return fmt.Errorf("failed to deploy setter: %w", err)
+	}
+	if _, err = s.authority.Delegate(ctx, s.walletPool, deployer, client,
+		s.setterAddr, s.startSlot(), feeCap, tipCap, s.logger); err != nil {
+		return fmt.Errorf("failed to set slot 0: %w", err)
+	}
+	if _, err = s.authority.Delegate(ctx, s.walletPool, deployer, client,
+		s.runtimeAddr, make([]byte, 32), feeCap, tipCap, s.logger); err != nil {
+		return fmt.Errorf("failed to delegate runtime: %w", err)
+	}
+	if err = s.authority.VerifyDelegation(ctx, client, s.runtimeAddr); err != nil {
+		return err
 	}
 
 	maxPending := s.options.MaxPending
 	if maxPending == 0 {
-		maxPending = uint64(len(TxSpecs))
+		maxPending = s.options.Throughput * 2
 	}
-
 	var timeout time.Duration
 	if s.options.Timeout != "" {
-		parsed, err := time.ParseDuration(s.options.Timeout)
-		if err != nil {
-			return fmt.Errorf("invalid timeout value: %v", err)
+		parsed, perr := time.ParseDuration(s.options.Timeout)
+		if perr != nil {
+			return fmt.Errorf("invalid timeout value: %v", perr)
 		}
 		timeout = parsed
-		s.logger.Infof("timeout set to %v", timeout)
 	}
-
-	s.logger.Infof("replaying %d transactions per block cycle", len(TxSpecs))
 
 	return scenario.RunTransactionScenario(ctx, scenario.TransactionScenarioOptions{
 		TotalCount: s.options.TotalCount,
@@ -177,96 +221,48 @@ func (s *Scenario) Run(ctx context.Context) error {
 		Logger:     s.logger,
 		ProcessNextTxFn: func(ctx context.Context, params *scenario.ProcessNextTxParams) error {
 			logger := s.logger
-			receiptChan, tx, client, wallet, err := s.sendNextTransaction(ctx, params.TxIdx)
-			if client != nil {
-				logger = logger.WithField("rpc", client.GetName())
-			}
-			if tx != nil {
-				logger = logger.WithField("nonce", tx.Nonce())
+			receiptChan, tx, c, wallet, terr := s.sendNextTransaction(ctx, params.TxIdx)
+			if c != nil {
+				logger = logger.WithField("rpc", c.GetName())
 			}
 			if wallet != nil {
 				logger = logger.WithField("wallet", s.walletPool.GetWalletName(wallet.GetAddress()))
 			}
-
 			params.NotifySubmitted()
 			params.OrderedLogCb(func() {
-				specIdx := params.TxIdx % uint64(len(TxSpecs))
-				if err != nil {
-					logger.Warnf("could not send transaction: %v", err)
+				if terr != nil {
+					logger.Warnf("could not send transaction: %v", terr)
 				} else if s.options.LogTxs {
-					logger.Infof("sent tx #%6d (spec %2d): %v", params.TxIdx+1, specIdx, tx.Hash().String())
+					logger.Infof("sent tx #%6d: %v", params.TxIdx+1, tx.Hash().String())
 				} else {
-					logger.Debugf("sent tx #%6d (spec %2d): %v", params.TxIdx+1, specIdx, tx.Hash().String())
+					logger.Debugf("sent tx #%6d: %v", params.TxIdx+1, tx.Hash().String())
 				}
 			})
-
-			if _, waitErr := receiptChan.Wait(ctx); waitErr != nil {
-				return waitErr
+			if _, werr := receiptChan.Wait(ctx); werr != nil {
+				return werr
 			}
-
-			return err
+			return terr
 		},
 	})
 }
 
-func (s *Scenario) deployRunCode(ctx context.Context) (*txtypes.Receipt, error) {
-	deployer := s.walletPool.GetWellKnownWallet("deployer")
-	if deployer == nil {
-		return nil, fmt.Errorf("deployer wallet not found")
+// startSlot returns the slot-0 cursor the sweep starts from.
+func (s *Scenario) startSlot() []byte {
+	if s.options.ExistingSlots {
+		value := make([]byte, 32)
+		value[31] = StartSlotExisting
+		return value
 	}
-
-	client := s.walletPool.GetClient(
-		spamoor.WithClientSelectionMode(spamoor.SelectClientByIndex, 0),
-		spamoor.WithClientGroup(s.options.ClientGroup),
-	)
-	if client == nil {
-		return nil, scenario.ErrNoClients
-	}
-
-	baseFeeWei, tipFeeWei := spamoor.ResolveFees(s.options.BaseFee, s.options.TipFee, s.options.BaseFeeWei, s.options.TipFeeWei)
-	feeCap, tipCap, err := s.walletPool.GetSuggestedFees(client, baseFeeWei, tipFeeWei)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get suggested fees: %w", err)
-	}
-
-	// Contract creation: no To address, initcode as the payload.
-	txData, err := txbuilder.DynFeeTx(&txbuilder.TxMetadata{
-		GasFeeCap: uint256.MustFromBig(feeCap),
-		GasTipCap: uint256.MustFromBig(tipCap),
-		Gas:       s.options.DeployGas,
-		To:        nil,
-		Value:     uint256.NewInt(0),
-		Data:      RunCodeInitcode,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	tx, err := deployer.BuildDynamicFeeTx(txData)
-	if err != nil {
-		return nil, err
-	}
-
-	receipt, err := s.walletPool.GetTxPool().SendAndAwaitTransaction(ctx, deployer, tx, &spamoor.SendTransactionOptions{
-		Client:      client,
-		Rebroadcast: true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("deployment transaction failed: %w", err)
-	}
-	if receipt.Status != txtypes.ReceiptStatusSuccessful {
-		return nil, fmt.Errorf("deployment transaction reverted")
-	}
-
-	return receipt, nil
+	return StartSlotNew
 }
+
+func sloadInitcode() []byte { return RuntimeInitcode }
 
 func (s *Scenario) sendNextTransaction(ctx context.Context, txIdx uint64) (scenario.ReceiptChan, *txtypes.Transaction, *spamoor.Client, *spamoor.Wallet, error) {
 	wallet := s.walletPool.GetWallet(spamoor.SelectWalletByIndex, int(txIdx))
 	if wallet == nil {
 		return nil, nil, nil, nil, scenario.ErrNoWallet
 	}
-
 	client := s.walletPool.GetClient(
 		spamoor.WithClientSelectionMode(spamoor.SelectClientByIndex, int(txIdx)),
 		spamoor.WithClientGroup(s.options.ClientGroup),
@@ -274,37 +270,34 @@ func (s *Scenario) sendNextTransaction(ctx context.Context, txIdx uint64) (scena
 	if client == nil {
 		return nil, nil, client, wallet, scenario.ErrNoClients
 	}
-
 	if err := wallet.ResetNoncesIfNeeded(ctx, client); err != nil {
 		return nil, nil, client, wallet, err
 	}
-
 	baseFeeWei, tipFeeWei := spamoor.ResolveFees(s.options.BaseFee, s.options.TipFee, s.options.BaseFeeWei, s.options.TipFeeWei)
 	feeCap, tipCap, err := s.walletPool.GetSuggestedFees(client, baseFeeWei, tipFeeWei)
 	if err != nil {
-		return nil, nil, client, wallet, fmt.Errorf("failed to get suggested fees: %w", err)
+		return nil, nil, client, wallet, err
 	}
 
-	// The block is replayed in order; wrapping starts the next cycle.
-	spec := TxSpecs[txIdx%uint64(len(TxSpecs))]
-
+	// The loop is gas-bounded, so the only per-transaction variable is the
+	// gas limit; the sweep position is carried in the authority's slot 0.
+	gas := GasLimits[txIdx%uint64(len(GasLimits))]
+	authority := s.authority.Address()
 	txData, err := txbuilder.DynFeeTx(&txbuilder.TxMetadata{
 		GasFeeCap: uint256.MustFromBig(feeCap),
 		GasTipCap: uint256.MustFromBig(tipCap),
-		Gas:       spec.Gas,
-		To:        &s.targetAddr,
+		Gas:       gas,
+		To:        &authority,
 		Value:     uint256.NewInt(0),
-		Data:      spec.CallData,
+		Data:      nil,
 	})
 	if err != nil {
 		return nil, nil, client, wallet, err
 	}
-
 	tx, err := wallet.BuildDynamicFeeTx(txData)
 	if err != nil {
 		return nil, nil, client, wallet, err
 	}
-
 	receiptChan := make(scenario.ReceiptChan, 1)
 	err = s.walletPool.GetTxPool().SendTransaction(ctx, wallet, tx, &spamoor.SendTransactionOptions{
 		Client:      client,
@@ -313,19 +306,11 @@ func (s *Scenario) sendNextTransaction(ctx context.Context, txIdx uint64) (scena
 		OnComplete: func(tx *txtypes.Transaction, receipt *txtypes.Receipt, err error) {
 			receiptChan <- receipt
 		},
-		OnConfirm: func(tx *txtypes.Transaction, receipt *txtypes.Receipt) {
-			// gasUsed well below the limit means the loop exited early.
-			if receipt.GasUsed < spec.Gas-spec.Gas/100 {
-				s.logger.Warnf("tx %v used %d of %d gas - loop may have exited early",
-					tx.Hash().Hex(), receipt.GasUsed, spec.Gas)
-			}
-		},
 		LogFn: spamoor.GetDefaultLogFn(s.logger, "", fmt.Sprintf("%6d", txIdx+1), tx),
 	})
 	if err != nil {
 		wallet.MarkSkippedNonce(tx.Nonce())
 		return nil, nil, client, wallet, err
 	}
-
 	return receiptChan, tx, client, wallet, nil
 }

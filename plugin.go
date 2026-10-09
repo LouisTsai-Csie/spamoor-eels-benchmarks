@@ -2,7 +2,11 @@
 package plugin
 
 import (
-	"github.com/ethpandaops/spamoor/plugins/eels-benchmarks/accountaccess"
+	"github.com/ethpandaops/spamoor/plugins/spamoor-eels-benchmarks/accountcall"
+	"github.com/ethpandaops/spamoor/plugins/spamoor-eels-benchmarks/accountload"
+	"github.com/ethpandaops/spamoor/plugins/spamoor-eels-benchmarks/deploytargets"
+	"github.com/ethpandaops/spamoor/plugins/spamoor-eels-benchmarks/sloadbloated"
+	"github.com/ethpandaops/spamoor/plugins/spamoor-eels-benchmarks/sstorebloated"
 	"github.com/ethpandaops/spamoor/scenario"
 )
 
@@ -15,7 +19,11 @@ var PluginDescriptor = scenario.PluginDescriptor{
 			Name:        "Benchmarks",
 			Description: "execution-specs repricing benchmarks",
 			Descriptors: []*scenario.Descriptor{
-				&accountaccess.ScenarioDescriptor,
+				&deploytargets.ScenarioDescriptor,
+				&accountload.ScenarioDescriptor,
+				&accountcall.ScenarioDescriptor,
+				&sloadbloated.ScenarioDescriptor,
+				&sstorebloated.ScenarioDescriptor,
 			},
 		},
 	},
